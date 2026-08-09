@@ -831,7 +831,7 @@ function renderFavorites() {
             : msg.image
                 ? `<img src="${msg.image}" style="max-width:100%;max-height:180px;border-radius:8px;display:block;margin-top:4px;cursor:pointer;" onclick="if(typeof viewImage==='function')viewImage('${msg.image.replace(/'/g,'\\\'')}')" loading="lazy">`
                 : msg.voice
-                    ? `<div style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:rgba(var(--accent-color-rgb),0.1);border-radius:20px;"><svg viewBox="0 0 22 22" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent-color);flex-shrink:0;"><circle cx="6" cy="11" r="1.3" fill="currentColor" stroke="none"/><path d="M10 8 A 3.5 3.5 0 0 1 10 14"/><path d="M13 5 A 7 7 0 0 1 13 17"/></svg><span style="font-size:12px;color:var(--accent-color);">${msg.voice.duration || 0}"</span></div>${msg.voice.fakeText ? `<div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">${msg.voice.fakeText.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>` : ''}`
+                    ? `<div class="fav-voice-btn" data-msg-id="${msg.id}" data-fake-text="${(msg.voice.fakeText||'').replace(/"/g,'&quot;')}" style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:rgba(var(--accent-color-rgb),0.1);border-radius:20px;cursor:pointer;"><svg viewBox="0 0 22 22" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent-color);flex-shrink:0;"><circle cx="6" cy="11" r="1.3" fill="currentColor" stroke="none"/><path d="M10 8 A 3.5 3.5 0 0 1 10 14"/><path d="M13 5 A 7 7 0 0 1 13 17"/></svg><span style="font-size:12px;color:var(--accent-color);">${msg.voice.duration || 0}"</span></div>${msg.voice.fakeText ? `<div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">${msg.voice.fakeText.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>` : ''}`
                     : '';
         const avatarEl = isUser
             ? (typeof DOMElements !== 'undefined' ? DOMElements.me.avatar : null)
@@ -885,6 +885,112 @@ function renderFavorites() {
                     }
                 }
                 renderFavorites();
+            }
+        });
+    });
+
+    // 语音条点击播放
+    let _favCurrentAudio = null;
+    let _favCurrentBtn = null;
+
+    list.querySelectorAll('.fav-voice-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (btn.dataset.playing === '1') {
+                // 点同一个正在播的 → 暂停
+                if (_favCurrentAudio) { _favCurrentAudio.pause(); _favCurrentAudio = null; }
+                btn.dataset.playing = '0';
+                btn.style.opacity = '1';
+                _favCurrentBtn = null;
+                return;
+            }
+
+            // 停掉正在播的其他语音
+            if (_favCurrentAudio) {
+                _favCurrentAudio.pause();
+                _favCurrentAudio = null;
+            }
+            if (_favCurrentBtn && _favCurrentBtn !== btn) {
+                _favCurrentBtn.dataset.playing = '0';
+                _favCurrentBtn.style.opacity = '1';
+                _favCurrentBtn = null;
+            }
+
+            const msgId = btn.dataset.msgId;
+            const fakeText = btn.dataset.fakeText;
+            btn.dataset.playing = '1';
+            btn.style.opacity = '0.6';
+            _favCurrentBtn = btn;
+            try {
+                let audioUrl = null;
+
+                // 先查 IndexedDB 持久化缓存（有缓存则直接播，不依赖 TTS 配置）
+                try {
+                    // 阶段四：键名带 SESSION_ID 前缀；值可以是 base64 或 oss:// 引用
+                    const key = window.favAudioKey ? window.favAudioKey(msgId) : `favAudio_${msgId}`;
+                    let stored = await localforage.getItem(key);
+                    // 兼容旧键名（无 SESSION_ID 前缀）
+                    if (!stored) {
+                        stored = await localforage.getItem(`favAudio_${msgId}`);
+                    }
+                    if (stored && typeof stored === 'string') {
+                        if (stored.startsWith('oss://')) {
+                            // 云端引用：fetch blob URL
+                            if (window.CloudMedia) {
+                                const blobUrl = await window.CloudMedia.fetchUrl(stored);
+                                audioUrl = blobUrl;
+                            }
+                        } else {
+                            // 老格式：裸 base64
+                            const binary = atob(stored);
+                            const bytes = new Uint8Array(binary.length);
+                            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                            const blob = new Blob([bytes], { type: 'audio/mpeg' });
+                            audioUrl = URL.createObjectURL(blob);
+                        }
+                    }
+                } catch (e) {}
+
+                // 没有缓存才需要 TTS，此时检查配置是否就绪
+                if (!audioUrl) {
+                    if (!fakeText) {
+                        btn.dataset.playing = '0';
+                        btn.style.opacity = '1';
+                        if (_favCurrentBtn === btn) { _favCurrentBtn = null; }
+                        return;
+                    }
+                    if (!window.voiceTTS || !window.voiceTTS.isTtsReady()) {
+                        if (typeof showNotification === 'function') showNotification('请先在聊天设置里配置真实语音', 'info');
+                        btn.dataset.playing = '0';
+                        btn.style.opacity = '1';
+                        if (_favCurrentBtn === btn) { _favCurrentBtn = null; }
+                        return;
+                    }
+                    audioUrl = await window.voiceTTS.getAudioForMessage(msgId, fakeText);
+                }
+
+                // 加载期间可能已经被别的点击停掉了
+                if (_favCurrentBtn !== btn) return;
+
+                const audio = new Audio(audioUrl);
+                if (window.voiceTTS && window.voiceTTS.applyPlaybackSettings) window.voiceTTS.applyPlaybackSettings(audio);
+                _favCurrentAudio = audio;
+                audio.play();
+                audio.onended = () => {
+                    btn.dataset.playing = '0';
+                    btn.style.opacity = '1';
+                    if (_favCurrentBtn === btn) { _favCurrentBtn = null; _favCurrentAudio = null; }
+                };
+                audio.onerror = () => {
+                    btn.dataset.playing = '0';
+                    btn.style.opacity = '1';
+                    if (_favCurrentBtn === btn) { _favCurrentBtn = null; _favCurrentAudio = null; }
+                };
+            } catch (err) {
+                btn.dataset.playing = '0';
+                btn.style.opacity = '1';
+                if (_favCurrentBtn === btn) { _favCurrentBtn = null; _favCurrentAudio = null; }
+                console.error('[fav voice]', err);
             }
         });
     });
@@ -1285,7 +1391,15 @@ function initComboMenu() {
     function makeStickerItem(src, onClick) {
         const item = document.createElement('div');
         item.className = 'sticker-grid-item';
-        item.innerHTML = `<img src="${src}" loading="lazy">`;
+        // 阶段三B：识别 oss:// 走懒加载
+        const isCloud = typeof src === 'string' && src.indexOf('oss://') === 0;
+        item.innerHTML = `<img loading="lazy">`;
+        const imgEl = item.querySelector('img');
+        if (isCloud) {
+            if (window.CloudMedia) window.CloudMedia.bindLazyImage(imgEl, src);
+        } else {
+            imgEl.src = src;
+        }
         item.onclick = (e) => { e.stopPropagation(); onClick(); };
         return item;
     }
@@ -1294,8 +1408,15 @@ function initComboMenu() {
         const item = document.createElement('div');
         item.className = 'sticker-grid-item';
         item.style.position = 'relative';
-        item.innerHTML = `<img src="${src}" loading="lazy"><div class="sticker-delete-btn" title="删除"><i class="fas fa-times"></i></div>`;
-        item.querySelector('img').onclick = (e) => { e.stopPropagation(); onClick(); };
+        const isCloud = typeof src === 'string' && src.indexOf('oss://') === 0;
+        item.innerHTML = `<img loading="lazy"><div class="sticker-delete-btn" title="删除"><i class="fas fa-times"></i></div>`;
+        const imgEl = item.querySelector('img');
+        if (isCloud) {
+            if (window.CloudMedia) window.CloudMedia.bindLazyImage(imgEl, src);
+        } else {
+            imgEl.src = src;
+        }
+        imgEl.onclick = (e) => { e.stopPropagation(); onClick(); };
         item.querySelector('.sticker-delete-btn').onclick = (e) => { e.stopPropagation(); onDelete(); };
         return item;
     }
@@ -1321,7 +1442,15 @@ function initComboMenu() {
                 picker.classList.remove('active');
                 const delayRange = settings.replyDelayMax - settings.replyDelayMin;
                 setTimeout(simulateReply, settings.replyDelayMin + Math.random() * delayRange);
-            }, () => {
+            }, async () => {
+                // 阶段三B：如果是云端引用，先删云端（失败不阻塞）
+                if (window.CloudMedia && typeof src === 'string' && src.indexOf('oss://') === 0) {
+                    try {
+                        await window.CloudMedia.delete(src);
+                    } catch (err) {
+                        console.warn('[cloud-media] 云端删除失败', err);
+                    }
+                }
                 myStickerLibrary.splice(idx, 1);
                 localforage.setItem(getStorageKey('myStickerLibrary'), myStickerLibrary);
                 showNotification('✓ 已删除', 'success');

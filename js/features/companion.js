@@ -47,8 +47,9 @@
         backgrounds: { study: [], work: [], exercise: [], sleep: [] },
         voices:      { study: [], work: [], exercise: [], sleep: [] },
         noises:      { study: [], work: [], exercise: [], sleep: [] },
-        lastNoiseChoice: { study: null, work: null, exercise: null, sleep: null }, // null=无声, 'rain'/'fire'=内置, 字符串id=用户上传
-        lastPlayMode:    { study: 'single', work: 'single', exercise: 'single', sleep: 'single' }, // 'single'/'list'/'random'
+        selectedBg:  { study: null, work: null, exercise: null, sleep: null }, // 选中的背景 id
+        lastNoiseChoice: { study: null, work: null, exercise: null, sleep: null },
+        lastPlayMode:    { study: 'single', work: 'single', exercise: 'single', sleep: 'single' },
         history: []
     };
 
@@ -68,6 +69,7 @@
             backgrounds: { study: [], work: [], exercise: [], sleep: [] },
             voices:      { study: [], work: [], exercise: [], sleep: [] },
             noises:      { study: [], work: [], exercise: [], sleep: [] },
+            selectedBg:  { study: null, work: null, exercise: null, sleep: null },
             lastNoiseChoice: { study: null, work: null, exercise: null, sleep: null },
             lastPlayMode:    { study: 'single', work: 'single', exercise: 'single', sleep: 'single' },
             history: []
@@ -137,10 +139,66 @@
             const key = typeof getStorageKey === 'function'
                 ? getStorageKey(STORAGE_KEY)
                 : (window.APP_PREFIX || 'CHAT_APP_V3_') + STORAGE_KEY;
-            await localforage.setItem(key, companionData);
+
+            // 保存前深拷贝并过滤掉：blob URL（刷新失效）、临时上传状态字段
+            const toSave = JSON.parse(JSON.stringify(companionData, function (k, v) {
+                // 过滤临时字段
+                if (k === '_uploading' || k === '_progress' || k === '_localOnly') return undefined;
+                // 过滤 blob URL（data 字段只允许 base64 或 oss://）
+                if (k === 'data' && typeof v === 'string' && v.startsWith('blob:')) return undefined;
+                return v;
+            }));
+            // 过滤掉 data 为空（被上面过滤掉 blob URL）的背景条目
+            const modes = ['study', 'work', 'exercise', 'sleep'];
+            modes.forEach(function (m) {
+                if (toSave.backgrounds && Array.isArray(toSave.backgrounds[m])) {
+                    toSave.backgrounds[m] = toSave.backgrounds[m].filter(function (bg) {
+                        return bg && bg.data; // data 为空的条目（blob URL 被过滤）不保存
+                    });
+                }
+            });
+
+            await localforage.setItem(key, toSave);
         } catch (e) {
             console.warn('[companion] 保存数据失败', e);
         }
+    }
+
+    // ─── 阶段三B：云端媒体缓存（session 内复用 blob URL，退出陪伴时清理）────
+    var _mediaUrlCache = new Map(); // ossRef → blobUrl
+
+    function _clearMediaCache() {
+        _mediaUrlCache.forEach(function (blobUrl) {
+            try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+        });
+        _mediaUrlCache.clear();
+    }
+
+    /**
+     * 从 oss:// 引用获取可播放/可显示的 URL
+     * 内存命中直接返回；否则 fetch 后缓存
+     */
+    async function _resolveMediaUrl(ossRef) {
+        if (!ossRef || ossRef.indexOf('oss://') !== 0) return ossRef;
+        if (_mediaUrlCache.has(ossRef)) return _mediaUrlCache.get(ossRef);
+        if (!window.CloudMedia) throw new Error('CloudMedia 未加载');
+        const blobUrl = await window.CloudMedia.fetchUrl(ossRef);
+        _mediaUrlCache.set(ossRef, blobUrl);
+        return blobUrl;
+    }
+
+    /**
+     * 上传媒体到云端（8 处上传点共用）
+     * @param {string|File} source  base64 字符串或 File 对象（File 优先，避免大文件内存爆炸）
+     * @param {string} category
+     * @returns {Promise<{data: string, cloudKey: string}>}
+     */
+    async function _uploadCompanionMedia(source, category) {
+        if (!window.CloudMedia || !window.CloudSync || !window.CloudSync.isConnected()) {
+            throw new Error('未连接云端');
+        }
+        const result = await window.CloudMedia.upload(source, category);
+        return { data: result.url, cloudKey: result.key };
     }
 
     // ─── 文件读取工具 ────────────────────────────────────────────────────────
@@ -182,7 +240,7 @@
             'background:rgba(0,0,0,0.5)',
             'display:flex', 'align-items:center', 'justify-content:center',
             'opacity:1', 'pointer-events:all',
-            'animation:companionFadeIn 0.25s ease'
+            'animation:companionFadeIn 0.25s ease','backdrop-filter:blur(8px)','-webkit-backdrop-filter:blur(8px)'
         ].join(';'));
 
         modal.innerHTML = `
@@ -281,6 +339,11 @@
 
     function getPartnerAvatarSrc() {
         const img = document.querySelector('#partner-avatar img,[id*="partner-avatar"] img,.partner-avatar img');
+        return img ? img.src : null;
+    }
+
+    function getMyAvatarSrc() {
+        const img = document.querySelector('#my-avatar img,.my-avatar img');
         return img ? img.src : null;
     }
 
@@ -385,10 +448,12 @@
 
     // ─── 陪伴时长统计 ───────────────────────────────────────────────────────
     let _sessionStartTime = null;   // 进陪伴页时记录
+    let _originalSessionStartTime = null; // 最初的开始时间（不受延长影响）
     let _accumulatedExtendTime = 0; // 之前几段陪伴累计时长（继续陪伴时累加）
 
     function startSessionClock() {
         _sessionStartTime = Date.now();
+        _originalSessionStartTime = Date.now();
         _accumulatedExtendTime = 0;
     }
     function getElapsedSeconds() {
@@ -429,6 +494,7 @@
     // 用户点场景卡 → 先让用户选时间 → 选完后再发起邀请
     async function selectMode(mode) {
         currentMode = mode;
+        window._companionSessionInitiator = 'user'; // 用户主动发起
         closeCompanionModal();
         // 打开时间选择，用户选完后再走邀请等待流程
         openTimeModal(mode, (selectedTime) => {
@@ -447,6 +513,7 @@
     // 梦角发起接受 → 直接进入陪伴页（用梦角说的那个时间）
     function enterWithInviteTime(mode, time) {
         currentMode = mode;
+        window._companionSessionInitiator = 'partner'; // 梦角主动发起
         // 设置时间状态（和 openTimeModal 里点按钮后的逻辑一致）
         if (time === 'rest') {
             isCountdown = false;
@@ -615,6 +682,8 @@
         // 如果当前已经在陪伴中或有其他陪伴弹窗/过渡画面在，跳过
         if (document.getElementById('companion-page')?.classList.contains('active')) return;
         if (document.querySelector('#companion-inviting-overlay, #companion-incoming-overlay, #companion-modal-dynamic, #setup-modal-dynamic, #time-modal-dynamic, .companion-transition')) return;
+        // 观影中，或者快到约定观影时间了（2小时内），不弹陪伴邀请
+        if (typeof window._cinemaShouldBlockInterruptions === 'function' && window._cinemaShouldBlockInterruptions()) return;
         // 通话中不弹陪伴邀请
         const isCallActive = document.getElementById('call-window')?.classList.contains('visible')
             || document.getElementById('call-incoming-overlay')?.classList.contains('visible')
@@ -756,14 +825,33 @@
             }
         } catch (e) { console.warn('[companion] invite notification error:', e); }
 
-        // 22 秒未接听自动消失 → 错过（不走过渡画面）
+        // 60 秒未接听自动消失 → 错过（不走过渡画面）
         const autoTimer = setTimeout(() => {
             if (!overlay.isConnected) return; // 已被其他操作移除了
             try { if (typeof window.stopCurrentSound === 'function') window.stopCurrentSound(); } catch(e) {}
             overlay.remove();
             const sceneName = MODES[mode]?.label?.replace(/^一起/, '') || '';
             sendChatEvent('fa-heart-crack', `错过了${partnerName}的${sceneName}邀请`, null);
-        }, 22000);
+            // 写入陪伴日记（错过记录）
+            try {
+                if (typeof window.addCompanionDiaryEntry === 'function') {
+                    // 90% 概率有梦角备注
+                    const partnerNote = Math.random() < 0.9
+                        ? (typeof window.pickCompanionDiaryCards === 'function' ? window.pickCompanionDiaryCards() : '')
+                        : '';
+                    window.addCompanionDiaryEntry({
+                        id: Date.now(),
+                        ts: Date.now(),
+                        mode: mode,
+                        duration: 0,
+                        initiator: 'partner',
+                        missed: true,
+                        partnerNote: partnerNote,
+                        userNote: ''
+                    });
+                }
+            } catch(e) { console.warn('[companion] missed diary entry error:', e); }
+        }, 60000);
 
         // 拒绝
         overlay.querySelector('#companion-incoming-reject').addEventListener('click', () => {
@@ -1103,12 +1191,14 @@
             'background:rgba(0,0,0,0.5)',
             'display:flex', 'align-items:center', 'justify-content:center',
             'opacity:1', 'pointer-events:all',
-            'animation:companionFadeIn 0.25s ease'
+            'animation:companionFadeIn 0.25s ease',
+            'backdrop-filter:blur(8px)',
+            '-webkit-backdrop-filter:blur(8px)'
         ].join(';'));
 
         modal.innerHTML = `
             <div style="
-                background:#fff;border-radius:20px;padding:28px 24px 20px;
+                background:var(--secondary-bg, #fff);border-radius:20px;padding:28px 24px 20px;
                 width:min(92vw, 460px);max-height:85vh;overflow-y:auto;
                 box-shadow:0 20px 60px rgba(0,0,0,0.18);
                 animation:companionPopIn 0.3s cubic-bezier(0.34,1.56,0.64,1);
@@ -1189,7 +1279,18 @@
 
             notify('正在处理文件...', 'info');
             const base64 = await readFileAsBase64(file);
-            window._setupPendingBg = { type: isVideo ? 'video' : 'image', data: base64, name: file.name };
+            // 阶段三B：连了云端就上传，本地 pending 只存引用
+            let mediaData = base64;
+            let cloudKey = null;
+            try {
+                notify('正在上传到云端...', 'info', 2000);
+                const r = await _uploadCompanionMedia(base64, 'companion-backgrounds');
+                mediaData = r.data;
+                cloudKey = r.cloudKey;
+            } catch (e) {
+                console.warn('[companion] setup 背景云端上传失败，降级本地', e);
+            }
+            window._setupPendingBg = { type: isVideo ? 'video' : 'image', data: mediaData, cloudKey, name: file.name };
 
             const preview = modal.querySelector('#setup-dyn-bg-preview');
             preview.innerHTML = '';
@@ -1239,8 +1340,17 @@
                 }
                 try {
                     const base64 = await readFileAsBase64(file);
+                    let mediaData = base64;
+                    let cloudKey = null;
+                    try {
+                        const r = await _uploadCompanionMedia(base64, 'companion-voices');
+                        mediaData = r.data;
+                        cloudKey = r.cloudKey;
+                    } catch (e) {
+                        console.warn('[companion] setup 语音云端上传失败，降级本地', e);
+                    }
                     window._setupPendingVoices.push({
-                        id: generateId(), data: base64,
+                        id: generateId(), data: mediaData, cloudKey,
                         name: file.name.replace(/\.[^/.]+$/, ''),
                         addedAt: Date.now()
                     });
@@ -1440,7 +1550,8 @@
 
     // ─── 陪伴页面 ────────────────────────────────────────────────────────────
 
-    function openCompanionPage() {
+    function openCompanionPage(opts) {
+        opts = opts || {};
         const cfg = MODES[currentMode];
         const page = $('companion-page');
 
@@ -1453,9 +1564,13 @@
         // 防御：清理可能残留的白噪音（避免上次未完全关闭时新陪伴叠加播放）
         stopNoise();
 
-        // 设置背景
+        // 设置背景：优先用用户选定的背景，没有选定时用第一个
         const bgs = companionData.backgrounds[currentMode];
-        const bg = bgs[Math.floor(Math.random() * bgs.length)];
+        let bg = null;
+        if (bgs && bgs.length > 0) {
+            const selectedId = companionData.selectedBg && companionData.selectedBg[currentMode];
+            bg = (selectedId && bgs.find(b => b.id === selectedId)) || bgs[0];
+        }
         renderCompanionBackground(bg);
 
         // 设置提示文字
@@ -1477,7 +1592,10 @@
         document.body.style.overflow = 'hidden';
 
         // 启动会话时钟（统计陪伴时长用）
-        startSessionClock();
+        // 注意：恢复闪退会话时不要重置时钟（保留 resumeFromSession 里设置的 _sessionStartTime）
+        if (!opts.isResume) {
+            startSessionClock();
+        }
 
         // 清空本次陪伴的对话记录
         _sessionDialogue = [];
@@ -1488,18 +1606,16 @@
         // 续播上次的白噪音（如果有）
         resumeLastNoise();
 
-        console.log('[companion] 陪伴页面已打开');
+        console.log('[companion] 陪伴页面已打开' + (opts.isResume ? '（闪退恢复）' : ''));
     }
 
-    function renderCompanionBackground(bg) {
+    async function renderCompanionBackground(bg) {
         const container = $('companion-bg-container');
         const page = $('companion-page');
         if (!container) return;
         container.innerHTML = '';
 
         if (!bg) {
-            // 默认背景：跟随主题色的柔和浅色渐变
-            // 用主题色的低透明度叠加，叠在你设置的米黄基底（#FFF2E2）上
             const fallback = document.createElement('div');
             fallback.style.cssText = `
                 position:absolute;inset:0;
@@ -1509,18 +1625,27 @@
                     linear-gradient(135deg, #FFF2E2 0%, #FCE8D0 50%, #FFF2E2 100%);
             `;
             container.appendChild(fallback);
-            // 标记当前是浅色背景，让文字切换为深色
             if (page) page.classList.add('companion-light-bg');
             return;
         }
 
-        // 有用户背景，移除浅色标记
         if (page) page.classList.remove('companion-light-bg');
+
+        // 阶段三B：oss:// 引用先 fetch blob URL
+        let mediaSrc = bg.data;
+        if (typeof mediaSrc === 'string' && mediaSrc.indexOf('oss://') === 0) {
+            try {
+                mediaSrc = await _resolveMediaUrl(mediaSrc);
+            } catch (e) {
+                console.warn('[companion] 背景加载失败', e);
+                notify('背景加载失败，请检查网络', 'error');
+                return;
+            }
+        }
 
         if (bg.type === 'video') {
             const v = document.createElement('video');
-            v.src = bg.data;
-            v.muted = true;
+            v.src = mediaSrc;
             v.autoplay = true;
             v.loop = true;
             v.playsInline = true;
@@ -1528,7 +1653,7 @@
             container.appendChild(v);
         } else {
             const img = document.createElement('img');
-            img.src = bg.data;
+            img.src = mediaSrc;
             img.className = 'companion-bg-media';
             container.appendChild(img);
         }
@@ -1541,6 +1666,30 @@
         stopPartnerGoodnightCheck();
         recordHistory();
 
+        // 阶段三B：停止并清理背景视频（防止退出后声音继续播放）
+        try {
+            const container = document.getElementById('companion-bg-container');
+            if (container) {
+                container.querySelectorAll('video').forEach(function (v) {
+                    v.pause();
+                    v.src = '';
+                    v.load();
+                });
+                container.innerHTML = '';
+            }
+        } catch (e) {}
+
+        // 阶段三B：清理媒体 blob URL 缓存
+        try { _clearMediaCache(); } catch (e) {}
+
+        // 清除闪退恢复用的 live session（陪伴正常结束）
+        try { localforage.removeItem(getLiveSessionKey()).catch(() => {}); } catch (e) {}
+
+        // 计算本次时长 + 写入陪伴日记（在状态被清空之前）
+        const _diaryDurSec = getElapsedSeconds();
+        const _diaryMode = currentMode;
+        const _diaryInitiator = window._companionSessionInitiator === 'partner' ? 'partner' : 'user';
+
         // 默认留痕，除非显式 skipLogEvent
         if (!opts.skipLogEvent) {
             const sceneName = getSceneName();
@@ -1551,6 +1700,25 @@
             // 用场景对应的图标
             const sceneIcon = MODES[currentMode]?.icon || 'fa-moon';
             sendChatEvent(sceneIcon, label, elapsed);
+        }
+
+        // 写入陪伴日记（只有真正陪伴过、且时长 ≥ 30 秒才记录，避免误触）
+        try {
+            if (_diaryMode && _diaryDurSec >= 30 && typeof window.addCompanionDiaryEntry === 'function') {
+                const partnerNote = (typeof window.pickCompanionDiaryCards === 'function')
+                    ? window.pickCompanionDiaryCards()
+                    : '';
+                window.addCompanionDiaryEntry({
+                    ts: Date.now() - _diaryDurSec * 1000, // 用开始时间作为时间戳
+                    mode: _diaryMode,
+                    duration: _diaryDurSec,
+                    initiator: _diaryInitiator,
+                    partnerNote: partnerNote,
+                    userNote: ''
+                });
+            }
+        } catch (e) {
+            console.warn('[companion] write diary error:', e);
         }
 
         // 停止语音
@@ -1569,12 +1737,39 @@
         // 清空会话时钟
         _sessionStartTime = null;
         _accumulatedExtendTime = 0;
+        window._companionSessionInitiator = null;
 
         // 清空本次对话 + 气泡 + typing
         _sessionDialogue = [];
         const bubbleArea = document.getElementById('companion-bubble-area');
         if (bubbleArea) bubbleArea.innerHTML = '';
         hideCompanionTyping();
+
+        // 重置输入区状态（防止下次进来还是展开的）
+        const inputBar = document.getElementById('companion-input-bar');
+        const kbBtn = document.getElementById('companion-keyboard-btn');
+        const inputField = document.getElementById('companion-input-field');
+        if (inputBar) inputBar.classList.remove('visible');
+        if (kbBtn) kbBtn.classList.remove('active');
+        $('companion-page').classList.remove('companion-input-active');
+        if (inputField) inputField.value = '';
+
+        // 把表情面板放回原位置（如果被陪伴页占用了）
+        try {
+            const picker = document.getElementById('user-sticker-picker');
+            if (picker && picker.dataset.companionMoved === '1') {
+                picker.classList.remove('active');
+                picker.style.cssText = ''; // 清除内联样式
+                if (window.__stickerPickerOriginalParent) {
+                    if (window.__stickerPickerOriginalNextSibling) {
+                        window.__stickerPickerOriginalParent.insertBefore(picker, window.__stickerPickerOriginalNextSibling);
+                    } else {
+                        window.__stickerPickerOriginalParent.appendChild(picker);
+                    }
+                }
+                picker.dataset.companionMoved = '0';
+            }
+        } catch (e) { console.warn('[companion] restore picker failed', e); }
     }
 
     // ─── 白噪音 ──────────────────────────────────────────────────────────────
@@ -1596,7 +1791,7 @@
     // 启动白噪音播放
     // type: 'rain' | 'fire' | 'custom' | 'silent'
     // id: 当 type='custom' 时是用户上传项的 id
-    function startNoise(type, id) {
+    async function startNoise(type, id) {
         // 先停掉现有的
         stopNoise();
 
@@ -1619,6 +1814,16 @@
                 return;
             }
             src = item.data || item.src;
+            // 阶段三B：oss:// 引用先 fetch blob URL
+            if (typeof src === 'string' && src.indexOf('oss://') === 0) {
+                try {
+                    src = await _resolveMediaUrl(src);
+                } catch (e) {
+                    console.warn('[companion] 白噪音加载失败', e);
+                    notify('音乐加载失败，请检查网络', 'error');
+                    return;
+                }
+            }
         } else {
             return;
         }
@@ -1925,9 +2130,19 @@
                     const base64 = await readFileAsBase64(file);
                     const id = generateId();
                     if (!firstAddedId) firstAddedId = id;
+                    let mediaData = base64;
+                    let cloudKey = null;
+                    try {
+                        const r = await _uploadCompanionMedia(base64, 'companion-noises');
+                        mediaData = r.data;
+                        cloudKey = r.cloudKey;
+                    } catch (e) {
+                        console.warn('[companion] 白噪音云端上传失败，降级本地', e);
+                    }
                     companionData.noises[currentMode].push({
                         id,
-                        data: base64,
+                        data: mediaData,
+                        cloudKey,
                         name: file.name.replace(/\.[^/.]+$/, ''),
                         addedAt: Date.now()
                     });
@@ -2092,6 +2307,8 @@
 
         timerInterval = setInterval(() => {
             recomputeTimerFromAnchor();
+            // 每秒触发心跳（节流到 10 秒一次写盘）
+            tryHeartbeatLiveSession();
         }, 1000);
 
         // 切回前台时立即重算一次（修复锁屏/后台时倒计时停止的问题）
@@ -2101,6 +2318,9 @@
             };
             document.addEventListener('visibilitychange', _visibilityHandler);
         }
+
+        // 启动时立刻写入一次完整的 live session（用于闪退恢复）
+        writeLiveSession();
     }
 
     function stopTimer() {
@@ -2113,6 +2333,119 @@
             _visibilityHandler = null;
         }
     }
+
+    // ─── 闪退恢复：live session 持久化 ─────────────────
+    function getLiveSessionKey() {
+        return (typeof getStorageKey === 'function')
+            ? getStorageKey('companionLiveSession')
+            : (window.APP_PREFIX || 'CHAT_APP_V3_') + 'companionLiveSession';
+    }
+    let _lastHeartbeatTs = 0;
+    function writeLiveSession() {
+        try {
+            // 把累计时间合并到 startTs 里：虚拟起点 = 当前段起点 - 累计延长时间
+            // 这样恢复时直接 (Date.now() - startTs) 就是完整陪伴时长
+            const virtualStartTs = _sessionStartTime
+                ? _sessionStartTime - Math.floor((_accumulatedExtendTime || 0) * 1000)
+                : Date.now();
+            const payload = {
+                startTs: virtualStartTs,
+                heartbeatTs: Date.now(),
+                mode: currentMode,
+                initiator: window._companionSessionInitiator === 'partner' ? 'partner' : 'user',
+                isCountdown: !!isCountdown,
+                // 总时长：当前段 + 累计延长（这样剩余时间也对得上）
+                totalSeconds: (totalSeconds || 0) + Math.floor(_accumulatedExtendTime || 0),
+                accumulatedExtendTime: 0  // 已经合并到 startTs 里
+            };
+            localforage.setItem(getLiveSessionKey(), payload).catch(() => {});
+            _lastHeartbeatTs = Date.now();
+        } catch (e) {}
+    }
+    function tryHeartbeatLiveSession() {
+        // 节流：距离上次心跳 < 10 秒就跳过
+        if (Date.now() - _lastHeartbeatTs < 10000) return;
+        writeLiveSession();
+    }
+    function clearLiveSession() {
+        try {
+            // 用扫描方式删除所有 companionLiveSession 相关 key
+            // 不依赖 getLiveSessionKey()，避免 SESSION_ID 异步问题或伪造测试数据残留
+            localforage.keys().then(function(keys) {
+                const targets = keys.filter(function(k) {
+                    return k.indexOf('companionLiveSession') !== -1;
+                });
+                Promise.all(targets.map(function(k) {
+                    return localforage.removeItem(k).catch(function() {});
+                }));
+            }).catch(function() {});
+        } catch (e) {}
+        _lastHeartbeatTs = 0;
+    }
+    // 暴露给外部（启动时检测用）
+    window._companionRecoverModule = {
+        getLiveSessionKey: getLiveSessionKey,
+        clearLiveSession: clearLiveSession,
+        // 用恢复出来的状态继续陪伴
+        resumeFromSession: function(session) {
+            if (!session || !session.mode) return false;
+            try {
+                currentMode = session.mode;
+                window._companionSessionInitiator = session.initiator || 'user';
+                _accumulatedExtendTime = session.accumulatedExtendTime || 0;
+                // 用真实墙上时间算（不暂停）
+                const elapsedSinceStart = Math.floor((Date.now() - session.startTs) / 1000) + _accumulatedExtendTime;
+                if (session.isCountdown) {
+                    isCountdown = true;
+                    totalSeconds = session.totalSeconds;
+                    const remaining = session.totalSeconds - elapsedSinceStart;
+                    if (remaining <= 0) {
+                        // 时间已经过完了 → 让外层去写日记
+                        return false;
+                    }
+                    timerSeconds = remaining;
+                } else {
+                    // 正计时（睡觉）→ 从真实累计时间继续
+                    isCountdown = false;
+                    timerSeconds = elapsedSinceStart;
+                    totalSeconds = 0;
+                }
+                // 把 session 起点追回到原本的起点
+                _sessionStartTime = session.startTs;
+                _accumulatedExtendTime = 0;
+                openCompanionPage({ isResume: true });
+                return true;
+            } catch (e) {
+                console.warn('[companion] resume failed', e);
+                return false;
+            }
+        },
+        // 把会话作为已完成日记保存
+        saveSessionAsDiary: async function(session) {
+            if (!session || !session.mode) return;
+            // 按真实墙上时间算
+            let duration = Math.max(0, Math.floor((Date.now() - session.startTs) / 1000) + (session.accumulatedExtendTime || 0));
+            // 倒计时模式：时长不能超过总时长（时间到了就是到了）
+            if (session.isCountdown && session.totalSeconds && duration > session.totalSeconds) {
+                duration = session.totalSeconds;
+            }
+            if (duration < 30) return; // 太短，不记
+            // 走正常字卡逻辑（30% 不写、70% 抽 1-2 句）
+            const partnerNote = (typeof window.pickCompanionDiaryCards === 'function')
+                ? window.pickCompanionDiaryCards()
+                : '';
+            if (typeof window.addCompanionDiaryEntry === 'function') {
+                await window.addCompanionDiaryEntry({
+                    ts: session.startTs,
+                    mode: session.mode,
+                    duration: duration,
+                    initiator: session.initiator || 'user',
+                    partnerNote: partnerNote,
+                    userNote: ''
+                });
+            }
+        }
+    };
 
     function updateTimerDisplay() {
         const el = $('companion-timer-display');
@@ -2466,15 +2799,24 @@
     }
 
     let _isVoicePlaying = false;
-    function playVoice(v) {
+    async function playVoice(v) {
         if (!v || !v.data) return;
         if (currentAudio) {
             currentAudio.pause();
             currentAudio = null;
         }
-        const audio = new Audio(v.data);
+        // 阶段三B：oss:// 引用先 fetch blob URL
+        let src = v.data;
+        if (typeof src === 'string' && src.indexOf('oss://') === 0) {
+            try {
+                src = await _resolveMediaUrl(src);
+            } catch (e) {
+                console.warn('[companion] 语音加载失败', e);
+                return;
+            }
+        }
+        const audio = new Audio(src);
         _isVoicePlaying = true;
-        // 播放结束/出错时解锁
         audio.addEventListener('ended', () => { _isVoicePlaying = false; });
         audio.addEventListener('error', () => { _isVoicePlaying = false; });
         audio.play().catch(e => {
@@ -2486,8 +2828,8 @@
 
     // 点击空白区域 → 触发梦角字卡回复（模拟用户碰了一下梦角，但不写入用户消息）
     function handlePageClick(e) {
-        // 排除按钮、计时器区域、退出确认弹窗的点击
-        if (e.target.closest('button, input, #companion-timer-area, #companion-exit-confirm')) return;
+        // 排除按钮、计时器区域、退出确认弹窗、语音气泡的点击
+        if (e.target.closest('button, input, #companion-timer-area, #companion-exit-confirm, .companion-bubble-voice')) return;
         // 涟漪特效（始终响应）
         createRippleEffect(e.clientX, e.clientY);
         // 检查字卡是否为空（变量在 window._customReplies 或全局 customReplies）
@@ -2531,24 +2873,114 @@
         // 只在陪伴页激活时响应
         const page = document.getElementById('companion-page');
         if (!page || !page.classList.contains('active')) return;
-        // 过滤：语音消息不显示（陪伴页只显示文字+sticker）
-        if (message.voice) return;
-        // 过滤：既无文本也无图片的空消息
+
+        // 延迟150ms，等 MutationObserver 里的 maybeFakeVoiceForPartner 跑完
+        // 这样 message.voice 才有可能被设置上
+        setTimeout(() => {
+            // 再次检查页面是否还在
+            const p = document.getElementById('companion-page');
+            if (!p || !p.classList.contains('active')) return;
+
+            // 过滤：既无文本、无图片、无语音的空消息（延迟后判断，此时voice已被设置）
+            if (!message.text && !message.image && !message.voice) return;
+
+            // 记录到本次陪伴对话
+            _sessionDialogue.push({
+                text: message.voice ? (message.voice.fakeText || '') : (message.text || ''),
+                image: message.image || null,
+                sender: message.sender,
+                voice: message.voice ? {
+                    duration: message.voice.duration,
+                    fakeText: message.voice.fakeText,
+                    msgId: message.id
+                } : null,
+            });
+            hideCompanionTyping();
+            showCompanionBubble(message);
+        }, 150);
+    }
+
+    // 钩子：用户在陪伴页发送消息时，气泡同步显示
+    function onUserMessage(message) {
+        const page = document.getElementById('companion-page');
+        if (!page || !page.classList.contains('active')) return;
         if (!message.text && !message.image) return;
-        // 记录到本次陪伴对话（存快照避免被后续语音改造影响）
+        // 记录到本次陪伴对话
         _sessionDialogue.push({
             text: message.text || '',
             image: message.image || null,
-            sender: message.sender,
+            sender: 'user',
+            voice: null,
         });
-        // 显示气泡 + 隐藏 typing
-        hideCompanionTyping();
         showCompanionBubble(message);
+    }
+
+    let _bubbleAreaClickSetup = false;
+
+    function _setupBubbleAreaClick() {
+        if (_bubbleAreaClickSetup) return;
+        const area = document.getElementById('companion-bubble-area');
+        if (!area) return;
+        _bubbleAreaClickSetup = true;
+
+        // 用捕获阶段，在所有其他监听器之前处理语音点击
+        area.addEventListener('click', async function(e) {
+            const voiceBtn = e.target.closest('.companion-voice-bubble');
+            if (!voiceBtn) return;
+
+            // 阻止事件冒泡到companion-page，防止触发handlePageClick
+            e.stopPropagation();
+
+            if (voiceBtn.dataset.playing === '1') return;
+            if (!window.voiceTTS || !window.voiceTTS.isTtsReady()) {
+                if (typeof showNotification === 'function') showNotification('请先在聊天设置里配置真实语音', 'info');
+                return;
+            }
+
+            const msgId = voiceBtn.dataset.msgId;
+            const liveMsg = (typeof messages !== 'undefined')
+                ? messages.find(m => String(m.id) === String(msgId))
+                : null;
+            const liveText = (liveMsg && liveMsg.voice && liveMsg.voice.fakeText)
+                ? liveMsg.voice.fakeText
+                : voiceBtn.dataset.fakeText || '';
+            if (!liveText) return;
+
+            const bubble = voiceBtn.closest('.companion-bubble');
+            voiceBtn.dataset.playing = '1';
+            voiceBtn.style.opacity = '0.6';
+            try {
+                const audioUrl = await window.voiceTTS.getAudioForMessage(msgId, liveText);
+                const audio = new Audio(audioUrl);
+                if (window.voiceTTS.applyPlaybackSettings) window.voiceTTS.applyPlaybackSettings(audio);
+                if (bubble) bubble._isPlaying = true;
+                audio.play();
+                audio.onended = () => {
+                    if (bubble) bubble._isPlaying = false;
+                    voiceBtn.dataset.playing = '0';
+                    voiceBtn.style.opacity = '1';
+                    if (bubble) _startBubbleFade(bubble);
+                };
+                audio.onerror = () => {
+                    if (bubble) bubble._isPlaying = false;
+                    voiceBtn.dataset.playing = '0';
+                    voiceBtn.style.opacity = '1';
+                };
+            } catch (err) {
+                if (bubble) bubble._isPlaying = false;
+                voiceBtn.dataset.playing = '0';
+                voiceBtn.style.opacity = '1';
+                console.error('[companion voice]', err);
+            }
+        }, true); // true = 捕获阶段
     }
 
     function showCompanionBubble(message) {
         const area = document.getElementById('companion-bubble-area');
         if (!area) return;
+
+        // 确保全局点击委托已设置
+        _setupBubbleAreaClick();
 
         // 太多气泡时让最老的提前渐隐（最多保留 4 条）
         const activeBubbles = Array.from(area.querySelectorAll('.companion-bubble:not(.fading)'));
@@ -2558,33 +2990,85 @@
             setTimeout(() => { if (oldest.isConnected) oldest.remove(); }, 1000);
         }
 
+        const isUser = message.sender === 'user';
+        const isImage = !!message.image;
+        const isVoice = !isUser && !!message.voice;
         const bubble = document.createElement('div');
-        bubble.className = 'companion-bubble';
+        bubble.className = 'companion-bubble' + (isUser ? ' companion-bubble-user' : '') + (isVoice ? ' companion-bubble-voice' : '');
 
-        const avSrc = getPartnerAvatarSrc();
+        // 头像
+        const avSrc = isUser ? getMyAvatarSrc() : getPartnerAvatarSrc();
         const avatarHtml = avSrc
             ? `<img src="${avSrc}">`
             : `<i class="fas fa-user"></i>`;
 
-        // 文字 or 图片（sticker）
-        let contentHtml = '';
-        if (message.image) {
-            contentHtml = `<img src="${message.image}">`;
+        if (isVoice) {
+            // ── 语音条气泡 ──
+            const duration = message.voice.duration || 3;
+            const fakeText = message.voice.fakeText || '';
+            const msgId = message.id;
+            const widthPx = Math.round(80 + Math.min(duration, 60) / 60 * 100);
+            bubble.innerHTML = `
+                <div class="companion-bubble-avatar">${avatarHtml}</div>
+                <div class="companion-bubble-content companion-voice-bubble" style="cursor:pointer;padding:8px 12px;display:flex;flex-direction:column;gap:6px;" data-msg-id="${msgId}">
+                    <div style="min-width:${widthPx}px;display:flex;align-items:center;gap:8px;">
+                        <svg viewBox="0 0 22 22" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="6" cy="11" r="1.3" fill="currentColor" stroke="none"/>
+                            <path d="M10 8 A 3.5 3.5 0 0 1 10 14"/>
+                            <path d="M13 5 A 7 7 0 0 1 13 17"/>
+                        </svg>
+                        <span style="font-size:13px;">${duration}"</span>
+                    </div>
+                    ${fakeText ? `<div style="font-size:12px;opacity:0.85;border-top:1px solid rgba(0,0,0,0.08);padding-top:5px;">${escapeHtml(fakeText)}</div>` : ''}
+                </div>
+            `;
+            area.appendChild(bubble);
+
+            // 点击由 _setupBubbleAreaClick 的事件委托统一处理
+            const voiceBtn = bubble.querySelector('.companion-voice-bubble');
+            if (voiceBtn && fakeText) voiceBtn.dataset.fakeText = fakeText;
+
+            // 语音气泡：12秒后消失（给用户时间点击）
+            _startBubbleFadeDelayed(bubble, 12000);
+
+        } else if (isImage) {
+            bubble.classList.add('companion-bubble-image');
+            bubble.innerHTML = `
+                <div class="companion-bubble-avatar">${avatarHtml}</div>
+                <img class="companion-bubble-image-raw">
+            `;
+            area.appendChild(bubble);
+            // 支持 oss:// 云端图片懒加载
+            var imgEl = bubble.querySelector('img.companion-bubble-image-raw');
+            if (imgEl) {
+                var imgSrc = message.image || '';
+                if (imgSrc.indexOf('oss://') === 0 && window.CloudMedia) {
+                    window.CloudMedia.bindLazyImage(imgEl, imgSrc);
+                } else {
+                    imgEl.src = imgSrc;
+                }
+            }
+            _startBubbleFadeDelayed(bubble, 8000);
         } else {
-            contentHtml = escapeHtml(message.text || '');
+            bubble.innerHTML = `
+                <div class="companion-bubble-avatar">${avatarHtml}</div>
+                <div class="companion-bubble-content">${escapeHtml(message.text || '')}</div>
+            `;
+            area.appendChild(bubble);
+            _startBubbleFadeDelayed(bubble, 8000);
         }
+    }
 
-        bubble.innerHTML = `
-            <div class="companion-bubble-avatar">${avatarHtml}</div>
-            <div class="companion-bubble-content">${contentHtml}</div>
-        `;
-        area.appendChild(bubble);
+    function _startBubbleFadeDelayed(bubble, delay) {
+        setTimeout(() => _startBubbleFade(bubble), delay);
+    }
 
-        // 8 秒显示后启动 2s 渐隐 → 共 10s
-        setTimeout(() => {
-            bubble.classList.add('fading');
-            setTimeout(() => { if (bubble.isConnected) bubble.remove(); }, 1000);
-        }, 8000);
+    function _startBubbleFade(bubble) {
+        // 如果正在播放，等播放完再消失（由audio.onended触发）
+        if (bubble._isPlaying) return;
+        if (bubble.classList.contains('fading')) return;
+        bubble.classList.add('fading');
+        setTimeout(() => { if (bubble.isConnected) bubble.remove(); }, 1000);
     }
 
     function showCompanionTyping() {
@@ -2638,22 +3122,55 @@
         modal.id = 'companion-history-modal';
         modal.className = 'companion-history-modal active';
 
-        const partnerName = getPartnerName();
-        const avSrc = getPartnerAvatarSrc();
-        const avatarHtml = avSrc ? `<img src="${avSrc}">` : `<i class="fas fa-user"></i>`;
+        const partnerAvSrc = getPartnerAvatarSrc();
+        const partnerAvatarHtml = partnerAvSrc ? `<img src="${partnerAvSrc}">` : `<i class="fas fa-user"></i>`;
+        const userAvSrc = getMyAvatarSrc();
+        const userAvatarHtml = userAvSrc ? `<img src="${userAvSrc}">` : `<i class="fas fa-user"></i>`;
 
         let listHtml = '';
         if (_sessionDialogue.length === 0) {
             listHtml = `<div class="companion-history-empty">暂无对话</div>`;
         } else {
-            listHtml = _sessionDialogue.map(m => {
-                const contentHtml = m.image
-                    ? `<img src="${m.image}">`
-                    : escapeHtml(m.text || '');
+            listHtml = _sessionDialogue.map((m, idx) => {
+                const isUser = m.sender === 'user';
+                const avatarHtml = isUser ? userAvatarHtml : partnerAvatarHtml;
+                const itemClass = isUser
+                    ? 'companion-history-item companion-history-item-user'
+                    : 'companion-history-item';
+                if (m.image) {
+                    return `
+                        <div class="${itemClass} companion-history-item-image">
+                            <div class="companion-bubble-avatar">${avatarHtml}</div>
+                            <img class="companion-bubble-image-raw" src="${m.image}">
+                        </div>
+                    `;
+                }
+                if (m.voice) {
+                    const duration = m.voice.duration || 3;
+                    const fakeText = m.voice.fakeText || '';
+                    const msgId = m.voice.msgId;
+                    const widthPx = Math.round(80 + Math.min(duration, 60) / 60 * 100);
+                    return `
+                        <div class="${itemClass}">
+                            <div class="companion-bubble-avatar">${avatarHtml}</div>
+                            <div class="companion-bubble-content companion-history-voice-btn" style="cursor:pointer;padding:8px 12px;display:flex;flex-direction:column;gap:6px;" data-msg-id="${msgId}" data-fake-text="${escapeHtml(fakeText)}" data-idx="${idx}">
+                                <div style="min-width:${widthPx}px;display:flex;align-items:center;gap:8px;">
+                                    <svg viewBox="0 0 22 22" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <circle cx="6" cy="11" r="1.3" fill="currentColor" stroke="none"/>
+                                        <path d="M10 8 A 3.5 3.5 0 0 1 10 14"/>
+                                        <path d="M13 5 A 7 7 0 0 1 13 17"/>
+                                    </svg>
+                                    <span style="font-size:13px;">${duration}"</span>
+                                </div>
+                                ${fakeText ? `<div style="font-size:12px;opacity:0.85;border-top:1px solid rgba(0,0,0,0.08);padding-top:5px;">${escapeHtml(fakeText)}</div>` : ''}
+                            </div>
+                        </div>
+                    `;
+                }
                 return `
-                    <div class="companion-history-item">
+                    <div class="${itemClass}">
                         <div class="companion-bubble-avatar">${avatarHtml}</div>
-                        <div class="companion-bubble-content">${contentHtml}</div>
+                        <div class="companion-bubble-content">${escapeHtml(m.text || '')}</div>
                     </div>
                 `;
             }).join('');
@@ -2672,17 +3189,63 @@
 
         document.documentElement.appendChild(modal);
 
+        // 历史记录图片懒加载（oss:// 引用）
+        if (window.CloudMedia) {
+            modal.querySelectorAll('img.companion-bubble-image-raw').forEach(function(imgEl) {
+                var src = imgEl.getAttribute('src') || '';
+                if (src.indexOf('oss://') === 0) {
+                    imgEl.removeAttribute('src');
+                    window.CloudMedia.bindLazyImage(imgEl, src);
+                }
+            });
+        }
+
         // 关闭按钮
         modal.querySelector('.companion-history-close').addEventListener('click', () => {
             modal.classList.remove('active');
             setTimeout(() => { if (modal.isConnected) modal.remove(); }, 300);
+            const historyBtn = document.getElementById('companion-history-btn');
+            if (historyBtn) historyBtn.classList.remove('active');
         });
         // 点背景关闭
         modal.addEventListener('click', (e) => {
             if (e.target === modal) {
                 modal.classList.remove('active');
                 setTimeout(() => { if (modal.isConnected) modal.remove(); }, 300);
+                const historyBtn = document.getElementById('companion-history-btn');
+                if (historyBtn) historyBtn.classList.remove('active');
             }
+        });
+
+        // 历史记录里语音条点击播放
+        modal.querySelectorAll('.companion-history-voice-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                if (!window.voiceTTS || !window.voiceTTS.isTtsReady()) return;
+                if (btn.dataset.playing === '1') return;
+                const msgId = btn.dataset.msgId;
+                const fakeText = btn.dataset.fakeText;
+                if (!fakeText) return;
+                btn.dataset.playing = '1';
+                btn.style.opacity = '0.6';
+                try {
+                    const audioUrl = await window.voiceTTS.getAudioForMessage(msgId, fakeText);
+                    const audio = new Audio(audioUrl);
+                    if (window.voiceTTS.applyPlaybackSettings) window.voiceTTS.applyPlaybackSettings(audio);
+                    audio.play();
+                    audio.onended = () => {
+                        btn.dataset.playing = '0';
+                        btn.style.opacity = '1';
+                    };
+                    audio.onerror = () => {
+                        btn.dataset.playing = '0';
+                        btn.style.opacity = '1';
+                    };
+                } catch (e) {
+                    btn.dataset.playing = '0';
+                    btn.style.opacity = '1';
+                    console.error('[history voice]', e);
+                }
+            });
         });
 
         // 滚到底（最新对话）
@@ -2731,9 +3294,19 @@
                 // 改用当前场景的语音列表
                 const targetMode = currentMode || 'study';
                 if (!companionData.voices[targetMode]) companionData.voices[targetMode] = [];
+                let mediaData = base64;
+                let cloudKey = null;
+                try {
+                    const r = await _uploadCompanionMedia(base64, 'companion-voices');
+                    mediaData = r.data;
+                    cloudKey = r.cloudKey;
+                } catch (e) {
+                    console.warn('[companion] 语音云端上传失败，降级本地', e);
+                }
                 companionData.voices[targetMode].push({
                     id: generateId(),
-                    data: base64,
+                    data: mediaData,
+                    cloudKey,
                     name: file.name.replace(/\.[^/.]+$/, ''),
                     addedAt: Date.now()
                 });
@@ -2764,11 +3337,21 @@
 
         notify('正在处理...', 'info');
         const base64 = await readFileAsBase64(file);
-        const bg = { id: generateId(), type: isVideo ? 'video' : 'image', data: base64, name: file.name, addedAt: Date.now() };
+        let mediaData = base64;
+        let cloudKey = null;
+        try {
+            notify('正在上传到云端...', 'info', 2000);
+            const r = await _uploadCompanionMedia(base64, 'companion-backgrounds');
+            mediaData = r.data;
+            cloudKey = r.cloudKey;
+        } catch (e) {
+            console.warn('[companion] 背景云端上传失败，降级本地', e);
+        }
+        const bg = { id: generateId(), type: isVideo ? 'video' : 'image', data: mediaData, cloudKey, name: file.name, addedAt: Date.now() };
         companionData.backgrounds[currentMode].push(bg);
         await saveCompanionData();
 
-        // 立即切换背景
+        // 立即切换背景（renderCompanionBackground 会处理 oss:// 引用）
         renderCompanionBackground(bg);
         closeSettingsPanel();
         notify('背景已更换', 'success');
@@ -2819,6 +3402,9 @@
         if (!list) return;
         const mode = _mgrState.bg;
         const items = (companionData.backgrounds[mode] || []);
+        const selectedId = companionData.selectedBg && companionData.selectedBg[mode];
+        // 没有 selectedId 时默认第一个为选中
+        const activeId = selectedId || (items.length > 0 ? items[0].id : null);
 
         let html = '';
         if (items.length === 0) {
@@ -2827,30 +3413,58 @@
                 点击下方按钮上传图片或视频
             </div>`;
         } else {
-            html += items.map(bg => `
-                <div class="companion-bg-card" data-id="${bg.id}">
+            html += items.map(bg => {
+                const isCloud = typeof bg.data === 'string' && bg.data.indexOf('oss://') === 0;
+                const isUploading = bg._uploading === true;
+                const isActive = bg.id === activeId;
+                const thumbHtml = bg.type === 'video'
+                    ? (isCloud
+                        ? `<div class="companion-bg-thumb-placeholder"><i class="fas fa-video"></i></div><span class="type-badge">视频</span>`
+                        : `<video src="${bg.data}" muted></video><span class="type-badge">视频</span>`)
+                    : (isCloud
+                        ? `<img data-lazy-cloud-ref="${bg.data}" alt="">`
+                        : `<img src="${bg.data}" alt="">`);
+                return `
+                <div class="companion-bg-card${isActive ? ' companion-bg-card--active' : ''}" data-id="${bg.id}" data-action="select-bg">
                     <div class="companion-bg-card-thumb">
-                        ${bg.type === 'video'
-                            ? `<video src="${bg.data}" muted></video><span class="type-badge">视频</span>`
-                            : `<img src="${bg.data}" alt="">`
-                        }
+                        ${thumbHtml}
+                        ${isActive ? `<div class="companion-bg-card-check"><i class="fas fa-check"></i></div>` : ''}
+                        ${isUploading ? `<div class="companion-bg-upload-progress"><div class="companion-bg-upload-bar" style="width:${bg._progress || 0}%"></div><span class="companion-bg-upload-label">上传中…</span></div>` : ''}
                     </div>
                     <div class="companion-bg-card-info">
                         <div class="companion-bg-card-name">${escapeHtml(bg.name || '未命名')}</div>
-                        <div class="companion-bg-card-meta">${bg.type === 'video' ? '视频' : '图片'}</div>
+                        <div class="companion-bg-card-meta">${bg.type === 'video' ? '视频' : '图片'}${isActive ? ' · 使用中' : ''}</div>
                     </div>
                     <div class="companion-bg-card-actions">
-                        <button class="companion-mgr-iconbtn danger" data-action="delete-bg" data-id="${bg.id}" title="删除">
-                            <i class="fas fa-trash-can"></i>
-                        </button>
+                        ${!isUploading ? `<button class="companion-mgr-iconbtn danger" data-action="delete-bg" data-id="${bg.id}" title="删除"><i class="fas fa-trash-can"></i></button>` : ''}
                     </div>
                 </div>
-            `).join('');
+            `; }).join('');
         }
         html += `<button class="companion-mgr-add" id="companion-bg-add-btn">
             <i class="fas fa-plus"></i> 添加${escapeHtml(MODES[mode].label.slice(2))}背景
         </button>`;
         list.innerHTML = html;
+        // 绑定云端图懒加载
+        if (window.CloudMedia) {
+            list.querySelectorAll('img[data-lazy-cloud-ref]').forEach(function (imgEl) {
+                window.CloudMedia.bindLazyImage(imgEl, imgEl.getAttribute('data-lazy-cloud-ref'));
+            });
+        }
+        // 绑定点击选中
+        list.querySelectorAll('.companion-bg-card[data-action="select-bg"]').forEach(function (card) {
+            card.addEventListener('click', function (e) {
+                if (e.target.closest('[data-action="delete-bg"]')) return; // 点删除不触发选中
+                const id = card.dataset.id;
+                const bg = (companionData.backgrounds[mode] || []).find(b => b.id === id);
+                if (!bg || bg._uploading) return; // 上传中不可选
+                if (!companionData.selectedBg) companionData.selectedBg = {};
+                companionData.selectedBg[mode] = id;
+                saveCompanionData();
+                renderCompanionBgManager();
+                notify('已选定为当前背景', 'success');
+            });
+        });
     }
 
     // ── 渲染：陪伴语音列表 ──
@@ -2957,26 +3571,105 @@
             notify('请选择图片或视频文件', 'error');
             return;
         }
-        if (file.size > 100 * 1024 * 1024) notify('文件超过 100MB，加载可能较慢', 'warning');
+        if (file.size > 500 * 1024 * 1024) {
+            notify('文件超过 500MB，无法上传', 'error');
+            return;
+        }
+        if (file.size > 100 * 1024 * 1024) notify('文件较大，上传可能需要一些时间', 'info', 3000);
 
         await ensureDataLoaded();
+        const mode = _mgrState.bg;
+        const id = generateId();
+
+        // 1. 立刻用 ObjectURL 生成本地预览
+        const localUrl = URL.createObjectURL(file);
+
+        // 2. 创建占位条目，立刻插入列表
+        const placeholder = {
+            id,
+            type: isVideo ? 'video' : 'image',
+            data: localUrl,
+            name: file.name,
+            addedAt: Date.now(),
+            _uploading: true,
+            _progress: 0
+        };
+        if (!companionData.backgrounds[mode]) companionData.backgrounds[mode] = [];
+        companionData.backgrounds[mode].push(placeholder);
+        renderCompanionBgManager(); // 只在插入时全量渲染一次
+
+        // 只操作单个卡片进度条，不重建整个列表
+        function _updateCardProgress(pct) {
+            const list = document.getElementById('companion-bg-list');
+            if (!list) return;
+            const card = list.querySelector(`.companion-bg-card[data-id="${id}"]`);
+            if (!card) return;
+            const bar = card.querySelector('.companion-bg-upload-bar');
+            if (bar) bar.style.width = pct + '%';
+        }
+
+        // 3. 后台上传
         try {
-            notify('正在处理文件...', 'info');
-            const base64 = await readFileAsBase64(file);
-            const bg = {
-                id: generateId(),
-                type: isVideo ? 'video' : 'image',
-                data: base64,
-                name: file.name,
-                addedAt: Date.now()
-            };
-            companionData.backgrounds[_mgrState.bg].push(bg);
+            const cloudReady = !!(window.CloudMedia && window.CloudSync && window.CloudSync.isConnected());
+            let mediaData = localUrl;
+            let cloudKey = null;
+
+            if (cloudReady) {
+                let fakeProgress = 0;
+                const fakeTimer = setInterval(() => {
+                    fakeProgress = Math.min(fakeProgress + Math.random() * 12, 85);
+                    placeholder._progress = Math.round(fakeProgress);
+                    _updateCardProgress(placeholder._progress); // 只更新进度条，不重建列表
+                }, 800);
+
+                try {
+                    const r = await _uploadCompanionMedia(file, 'companion-backgrounds');
+                    mediaData = r.data;
+                    cloudKey = r.cloudKey;
+                } finally {
+                    clearInterval(fakeTimer);
+                }
+            } else {
+                // 没有配置云端存储：localUrl 是 blob: 临时地址，刷新后会失效，
+                // 保存时也会被专门过滤掉——图片转成本地能长期保存的 base64；
+                // 视频体积太大不适合转成base64存本地，提前告知用户，避免刷新后静默消失
+                if (isVideo) {
+                    notify('未连接云端时，视频背景刷新后会丢失，建议先配置云端存储', 'warning', 4000);
+                } else {
+                    try {
+                        mediaData = (typeof optimizeImage === 'function')
+                            ? await optimizeImage(file)
+                            : await new Promise((resolve, reject) => {
+                                const reader = new FileReader();
+                                reader.onload = () => resolve(reader.result);
+                                reader.onerror = reject;
+                                reader.readAsDataURL(file);
+                            });
+                    } catch (convErr) {
+                        console.warn('[companion] 本地转存失败，这条背景可能刷新后会丢失', convErr);
+                    }
+                }
+            }
+
+            // 4. 上传完成
+            placeholder.data = mediaData;
+            placeholder.cloudKey = cloudKey;
+            placeholder._uploading = false;
+            delete placeholder._progress;
+            if (mediaData !== localUrl) URL.revokeObjectURL(localUrl);
             await saveCompanionData();
-            renderCompanionBgManager();
+            renderCompanionBgManager(); // 上传完成后全量刷一次（去掉进度条，显示勾选）
             notify('背景已添加', 'success');
         } catch (err) {
             console.error('[companion] 背景上传失败', err);
-            notify('文件读取失败', 'error');
+            // 上传失败：不能把 blob URL 存进 localforage（刷新后会失效报错）
+            // 直接从数组里移除这条记录，告知用户重试
+            const idx = companionData.backgrounds[mode].indexOf(placeholder);
+            if (idx !== -1) companionData.backgrounds[mode].splice(idx, 1);
+            URL.revokeObjectURL(localUrl);
+            notify('上传失败，请检查网络后重试', 'error', 3000);
+            await saveCompanionData();
+            renderCompanionBgManager();
         }
         e.target.value = '';
     }
@@ -2994,10 +3687,22 @@
                 /\.(mp3|m4a|aac|wav|ogg|flac|amr|opus)$/i.test(file.name);
             if (!isAudio) { skippedCount++; continue; }
             try {
-                const base64 = await readFileAsBase64(file);
+                let mediaData = null;
+                let cloudKey = null;
+                const cloudReady = !!(window.CloudMedia && window.CloudSync && window.CloudSync.isConnected());
+                if (cloudReady) {
+                    const r = await _uploadCompanionMedia(file, 'companion-voices');
+                    mediaData = r.data;
+                    cloudKey = r.cloudKey;
+                } else {
+                    // 没连云端降级为 base64（兼容老逻辑）
+                    const base64 = await readFileAsBase64(file);
+                    mediaData = base64;
+                }
                 companionData.voices[_mgrState.voice].push({
                     id: generateId(),
-                    data: base64,
+                    data: mediaData,
+                    cloudKey,
                     name: file.name.replace(/\.[^/.]+$/, ''),
                     addedAt: Date.now()
                 });
@@ -3026,21 +3731,31 @@
 
         if (action === 'delete-bg') {
             if (!confirm('确定删除这个背景吗？')) return;
+            const item = companionData.backgrounds[mode].find(x => x.id === id);
             companionData.backgrounds[mode] = companionData.backgrounds[mode].filter(x => x.id !== id);
             saveCompanionData();
             renderCompanionBgManager();
             notify('已删除', 'success');
+            // 异步清云端（不阻塞 UI）
+            if (item && item.cloudKey && window.CloudMedia) {
+                window.CloudMedia.delete(item.cloudKey).catch(e => console.warn('[companion] 云端删除失败', e));
+            }
         } else if (action === 'delete-voice') {
             if (!confirm('确定删除这段语音吗？')) return;
+            const item = companionData.voices[mode].find(x => x.id === id);
             companionData.voices[mode] = companionData.voices[mode].filter(x => x.id !== id);
             saveCompanionData();
             renderCompanionVoiceManager();
             notify('已删除', 'success');
+            if (item && item.cloudKey && window.CloudMedia) {
+                window.CloudMedia.delete(item.cloudKey).catch(e => console.warn('[companion] 云端删除失败', e));
+            }
         } else if (action === 'play-voice') {
             const v = companionData.voices[mode].find(x => x.id === id);
             if (v) playVoice(v);
         } else if (action === 'delete-noise') {
             if (!confirm('确定删除这段音乐吗？')) return;
+            const item = companionData.noises[mode].find(x => x.id === id);
             companionData.noises[mode] = companionData.noises[mode].filter(x => x.id !== id);
             // 如果当前播放的就是这个，停掉
             const choice = companionData.lastNoiseChoice && companionData.lastNoiseChoice[mode];
@@ -3051,9 +3766,12 @@
             saveCompanionData();
             renderCompanionNoiseManager();
             notify('已删除', 'success');
+            if (item && item.cloudKey && window.CloudMedia) {
+                window.CloudMedia.delete(item.cloudKey).catch(e => console.warn('[companion] 云端删除失败', e));
+            }
         } else if (action === 'play-noise') {
             const v = companionData.noises[mode].find(x => x.id === id);
-            if (v) playVoice(v);  // 复用 playVoice（就是简单播放音频）
+            if (v) playVoice(v);
         }
     }
 
@@ -3086,10 +3804,21 @@
                 /\.(mp3|m4a|aac|wav|ogg|flac|amr|opus)$/i.test(file.name);
             if (!isAudio) { skippedCount++; continue; }
             try {
-                const base64 = await readFileAsBase64(file);
+                let mediaData = null;
+                let cloudKey = null;
+                const cloudReady = !!(window.CloudMedia && window.CloudSync && window.CloudSync.isConnected());
+                if (cloudReady) {
+                    const r = await _uploadCompanionMedia(file, 'companion-noises');
+                    mediaData = r.data;
+                    cloudKey = r.cloudKey;
+                } else {
+                    const base64 = await readFileAsBase64(file);
+                    mediaData = base64;
+                }
                 companionData.noises[_mgrState.noise].push({
                     id: generateId(),
-                    data: base64,
+                    data: mediaData,
+                    cloudKey,
                     name: file.name.replace(/\.[^/.]+$/, ''),
                     addedAt: Date.now()
                 });
@@ -3273,17 +4002,198 @@
         if (historyBtn) {
             historyBtn.addEventListener('click', (e) => {
                 e.stopPropagation();  // 阻止冒泡
+                historyBtn.classList.add('active');
                 openCompanionHistory();
             });
         }
 
         // 注册"梦角说话"钩子 — core.js addMessage 末尾会调用
         window._onPartnerMessage = onPartnerMessage;
+        // 注册"用户说话"钩子（陪伴页气泡同步显示用户消息）
+        window._onUserMessage = onUserMessage;
 
         // 监听首页 typing-indicator 的显示/隐藏，同步到陪伴页
         watchTypingIndicator();
 
+        // ── 键盘按钮 + 输入区绑定 ───────────────────────────────
+        bindCompanionInputBar();
+
         // 设置面板入口和相关元素已移除（统一去外观设置 → 背景&字体 管理）
+    }
+
+    // ─── 陪伴输入区逻辑 ─────────────────────────────────────
+    function bindCompanionInputBar() {
+        const kbBtn = document.getElementById('companion-keyboard-btn');
+        const bar = document.getElementById('companion-input-bar');
+        const field = document.getElementById('companion-input-field');
+        const emojiBtn = document.getElementById('companion-emoji-btn');
+        const imageBtn = document.getElementById('companion-image-btn');
+        const page = document.getElementById('companion-page');
+        if (!kbBtn || !bar || !field || !page) return;
+
+        // 切换显示/隐藏
+        kbBtn.addEventListener('click', () => {
+            const isVisible = bar.classList.contains('visible');
+            if (isVisible) {
+                bar.classList.remove('visible');
+                kbBtn.classList.remove('active');
+                page.classList.remove('companion-input-active');
+                field.blur();
+                // 收起时也关闭表情面板
+                const picker = document.getElementById('user-sticker-picker');
+                if (picker) picker.classList.remove('active');
+            } else {
+                bar.classList.add('visible');
+                kbBtn.classList.add('active');
+                page.classList.add('companion-input-active');
+                setTimeout(() => field.focus(), 50);
+            }
+        });
+
+        // 回车发送
+        field.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                doCompanionSend();
+            }
+        });
+
+        // 表情包按钮 → 触发主聊天的表情面板，并把面板移到陪伴页里浮起来显示
+        emojiBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            try {
+                const mainComboBtn = document.getElementById('combo-btn');
+                const picker = document.getElementById('user-sticker-picker');
+                if (!mainComboBtn || !picker) {
+                    if (typeof showNotification === 'function') showNotification('表情功能加载失败', 'error');
+                    return;
+                }
+
+                // 已经在陪伴页里显示 → 收起
+                if (picker.dataset.companionMoved === '1' && picker.classList.contains('active')) {
+                    picker.classList.remove('active');
+                    picker.style.display = 'none';
+                    return;
+                }
+
+                // 先记录原位置（第一次移动时）
+                if (picker.dataset.companionMoved !== '1') {
+                    window.__stickerPickerOriginalParent = picker.parentNode;
+                    window.__stickerPickerOriginalNextSibling = picker.nextSibling;
+                }
+
+                // 触发主聊天的初始化逻辑（让面板内容渲染好）
+                mainComboBtn.click();
+
+                // 物理移到陪伴页里
+                const companionPage = document.getElementById('companion-page');
+                if (companionPage) {
+                    companionPage.appendChild(picker);
+                    picker.dataset.companionMoved = '1';
+                    picker.classList.add('active');
+                    // 浮在陪伴输入区上方 + 圆角
+                    picker.style.cssText = 'position: absolute !important; left: 16px !important; right: 16px !important; bottom: 80px !important; top: auto !important; width: auto !important; max-width: none !important; max-height: 320px !important; z-index: 200 !important; display: flex !important; border-radius: 16px !important; overflow: hidden !important; box-shadow: 0 8px 32px rgba(0,0,0,0.25) !important;';
+
+                    // 关闭逻辑已统一到 document-level（在外面注册），这里不重复绑定
+                }
+            } catch (e) { console.warn('[companion] emoji click failed', e); }
+        });
+
+        // ── 表情面板统一关闭逻辑 ───────────────────────────────
+        if (!window.__companionStickerCloseInstalled) {
+            document.addEventListener('click', (e) => {
+                const picker = document.getElementById('user-sticker-picker');
+                if (!picker || picker.dataset.companionMoved !== '1') return;
+                if (!picker.classList.contains('active')) return;
+                const target = e.target;
+                if (!target) return;
+
+                // 点在面板内：判断是否要关闭
+                if (target.closest('#user-sticker-picker')) {
+                    // 排除：tab 切换、添加按钮、头部、上传 input 等
+                    if (target.closest('.combo-tab-btn') ||
+                        target.closest('.sticker-grid-add') ||
+                        target.closest('.combo-tabs-header') ||
+                        target.closest('.sticker-delete-btn') ||
+                        target.tagName === 'INPUT') {
+                        return;
+                    }
+                    // 点表情图片本身（IMG）或者表情 item 容器 → 立即隐藏面板（发送照常进行）
+                    if (target.tagName === 'IMG' ||
+                        target.closest('.sticker-grid-item') ||
+                        target.closest('.picker-item') ||
+                        target.closest('.poke-item')) {
+                        // 立即隐藏（让用户感觉点了就发了）
+                        picker.classList.remove('active');
+                        picker.style.display = 'none';
+                    }
+                    return;
+                }
+
+                // 点表情按钮本身 → 让它自己 toggle
+                if (target.closest('#companion-emoji-btn')) return;
+
+                // 点了其他地方 → 立即关闭
+                picker.classList.remove('active');
+                picker.style.display = 'none';
+            }, true);
+            window.__companionStickerCloseInstalled = true;
+        }
+
+        // 输入框获得焦点 → 关闭表情面板
+        field.addEventListener('focus', () => {
+            const picker = document.getElementById('user-sticker-picker');
+            if (picker && picker.dataset.companionMoved === '1' && picker.classList.contains('active')) {
+                picker.classList.remove('active');
+                picker.style.display = 'none';
+            }
+        });
+
+        // 图片按钮 → 触发主聊天的图片输入
+        imageBtn.addEventListener('click', () => {
+            try {
+                const mainImageInput = document.getElementById('image-input');
+                if (mainImageInput) mainImageInput.click();
+                else if (typeof showNotification === 'function') {
+                    showNotification('图片功能加载失败', 'error');
+                }
+            } catch (e) { console.warn('[companion] image click failed', e); }
+        });
+    }
+
+    function doCompanionSend() {
+        const field = document.getElementById('companion-input-field');
+        if (!field) return;
+        const text = (field.value || '').trim();
+        if (!text) return;
+
+        try {
+            // 把文字塞进主输入框
+            const mainInput = document.getElementById('message-input')
+                || document.querySelector('.message-input');
+            if (!mainInput) {
+                console.warn('[companion] 找不到主输入框');
+                return;
+            }
+            mainInput.value = text;
+
+            // 触发主聊天的发送按钮
+            const mainSendBtn = document.getElementById('send-btn')
+                || document.querySelector('[data-action="send"]');
+            if (mainSendBtn) {
+                mainSendBtn.click();
+            } else {
+                // 兜底：触发 input 的回车
+                const ev = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+                mainInput.dispatchEvent(ev);
+            }
+        } catch (e) {
+            console.warn('[companion] send failed', e);
+        }
+
+        // 清空陪伴输入框
+        field.value = '';
+        field.focus();
     }
 
     // ─── 入口 ────────────────────────────────────────────────────────────────
